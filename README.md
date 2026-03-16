@@ -36,7 +36,7 @@ L’obiettivo è mostrare, in modo accessibile ma rigoroso, come:
 # BAW2026
 
 <p align="center">
-  <img src="assets/img/logo.png" alt="Logo BAW2026" width="180">
+  <img src="logo_baw.png" alt="Logo BAW2026" width="180">
 </p>
 
 <p align="center">
