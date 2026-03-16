@@ -1,3 +1,4 @@
+![Logo](baw_logo.png)
 # BAW2026
 
 Slide del talk divulgativo:
@@ -32,4 +33,4 @@ L’obiettivo è mostrare, in modo accessibile ma rigoroso, come:
 - errori di interpretazione, semplificazioni eccessive e bias siano sempre dietro l’angolo;
 - serva cautela quando si passa dai dati alle conclusioni sul funzionamento della mente e del cervello.
 
-![Logo](baw_logo.png)
+
