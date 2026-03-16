@@ -1,0 +1,1581 @@
+---
+title: "Come leggiamo i dati sul cervello e perché è facile sbagliare strada"
+subtitle: "Brain Awareness Week 2026"
+author: "Giulia Calignano"
+lang: it
+format:
+  revealjs:
+    embed-resources: false
+    theme: default
+    css: custom_fixed.scss
+    footer: "<img src='baw_logo.png' style='height:100px; display:block; margin-left:0; margin-right:auto;'/>"
+    slide-number: true
+    progress: true
+    controls: true
+    transition: fade
+    center: false
+    width: 1600
+    height: 900
+    navigation-mode: linear
+    incremental: false
+    preview-links: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+
+
+```{r}
+#| include: false
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(plotly)
+library(purrr)
+library(scales)
+
+set.seed(42)
+
+theme_set(
+  theme_minimal(base_size = 22) +
+    theme(
+      plot.title = element_text(face = "bold", size = 22, colour = "#0f2d52"),
+      plot.subtitle = element_text(size = 14, colour = "#284b7a"),
+      axis.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+)
+
+# ---------- Helpers ----------
+
+rescale01 <- function(x) (x - min(x)) / (max(x) - min(x))
+
+signal_data <- function(n = 500) {
+  t <- seq(0, 10, length.out = n)
+  true <- 0.15 * sin(1.6 * t) + 0.05 * cos(3.3 * t) +
+    0.55 / (1 + exp(-(t - 4.3) * 3)) - 0.25 / (1 + exp(-(t - 7.8) * 6))
+  noise <- rnorm(n, 0, 0.08)
+  blink_idx <- sample(40:(n-40), 12)
+  raw <- true + noise
+  for (i in blink_idx) raw[(i-2):(i+2)] <- NA
+  tibble(
+    t = t,
+    true = true,
+    raw = raw
+  ) |>
+    mutate(
+      interp = zoo::na.approx(raw, na.rm = FALSE),
+      smooth = stats::filter(interp, rep(1/9, 9), sides = 2) |> as.numeric()
+    )
+}
+
+brain_points <- function(n = 3000) {
+  t <- runif(n, 0, 2*pi)
+  # cuore deformato per ottenere una silhouette "brain-like"
+  x <- 16 * sin(t)^3
+  y <- 13*cos(t) - 5*cos(2*t) - 2*cos(3*t) - cos(4*t)
+
+  x <- x / max(abs(x))
+  y <- y / max(abs(y))
+
+  left  <- tibble(x = -0.9 + 0.95*x + rnorm(n, 0, 0.02),
+                  y = 0.95*y + rnorm(n, 0, 0.02),
+                  lobe = sample(c("frontale", "parietale", "temporale", "occipitale"), n, TRUE))
+  right <- tibble(x =  0.9 - 0.95*x + rnorm(n, 0, 0.02),
+                  y = 0.95*y + rnorm(n, 0, 0.02),
+                  lobe = sample(c("frontale", "parietale", "temporale", "occipitale"), n, TRUE))
+
+  bind_rows(left, right) |>
+    mutate(alpha = pmin(1, rescale01(-((x)^2 + (y)^2)) + runif(dplyr::n(), 0, 0.3)))
+}
+
+pupil_points <- function(n = 5000) {
+  theta <- runif(n, 0, 2*pi)
+  r1 <- sqrt(runif(n, 0, 1))
+  iris <- tibble(
+    x = 2.2 * r1 * cos(theta),
+    y = 2.2 * r1 * sin(theta),
+    zone = "iride"
+  )
+
+  theta2 <- runif(n/2, 0, 2*pi)
+  r2 <- sqrt(runif(n/2, 0, 1))
+  pupil <- tibble(
+    x = 0.9 * r2 * cos(theta2),
+    y = 0.9 * r2 * sin(theta2),
+    zone = "pupilla"
+  )
+
+  eyelid <- tibble(
+    x = seq(-3.2, 3.2, length.out = 400),
+    y_top = 0.42 * sqrt(pmax(0, 10 - x^2)),
+    y_bottom = -0.42 * sqrt(pmax(0, 10 - x^2))
+  )
+
+  list(points = bind_rows(iris, pupil), eyelid = eyelid)
+}
+
+aoi_points <- function(n = 1800) {
+  tibble(
+    x = c(rnorm(n*0.7, 0, 0.55), rnorm(n*0.3, 1.5, 0.8)),
+    y = c(rnorm(n*0.7, 0, 0.55), rnorm(n*0.3, 0.2, 0.9)),
+    inside = abs(c(rnorm(n*0.7, 0, 0.55), rnorm(n*0.3, 1.5, 0.8))) < 1 &
+             abs(c(rnorm(n*0.7, 0, 0.55), rnorm(n*0.3, 0.2, 0.9))) < 1
+  )
+}
+
+missing_matrix <- function(subjects = 18, timepoints = 100) {
+  expand_grid(id = paste0("P", sprintf("%02d", 1:subjects)),
+              t = 1:timepoints) |>
+    group_by(id) |>
+    mutate(
+      base_p = runif(1, 0.05, 0.30),
+      missing = rbinom(n(), 1, pmin(0.95, base_p + dnorm(t, 80, 12) * 1.8)) == 1
+    ) |>
+    ungroup()
+}
+
+baseline_data <- function() {
+  t <- seq(0, 1000, by = 8)
+  raw <- 3.2 + 0.03*sin(t/70) + ifelse(t > 250, 0.3*exp(-(t-500)^2/(2*180^2)), 0) + rnorm(length(t), 0, 0.02)
+  b16 <- raw - median(raw[t <= 16])
+  b100 <- raw - median(raw[t <= 100])
+  b200 <- raw - median(raw[t <= 200])
+  tibble(t = t, `Nessuna baseline` = raw, `Baseline 16 ms` = b16, `Baseline 100 ms` = b100, `Baseline 200 ms` = b200) |>
+    pivot_longer(-t, names_to = "cond", values_to = "y")
+}
+
+multiverse_data <- function() {
+  crossing(
+    filtro = c("tutti i valori", "valori plausibili"),
+    aoi = c("schermo intero", "solo AOI"),
+    blink = c("escludi blink", "interpola blink"),
+    baseline = c("16 ms", "100 ms", "200 ms")
+  ) |>
+    mutate(
+      estimate = rnorm(n(), ifelse(filtro == "valori plausibili", -0.12, 0.03), 0.14) +
+        ifelse(aoi == "solo AOI", -0.08, 0.04) +
+        ifelse(blink == "interpola blink", 0.03, -0.02) +
+        case_when(
+          baseline == "16 ms" ~ 0.03,
+          baseline == "100 ms" ~ 0.00,
+          TRUE ~ -0.04
+        ),
+      low = estimate - runif(n(), 0.06, 0.18),
+      high = estimate + runif(n(), 0.06, 0.18),
+      robust = low > 0 | high < 0,
+      model = row_number()
+    )
+}
+
+brain_df <- brain_points()
+pup <- pupil_points()
+sig <- signal_data()
+aoi <- aoi_points()
+miss <- missing_matrix()
+base_df <- baseline_data()
+multi <- multiverse_data()
+```
+
+## Il punto di partenza
+
+::: {.columns}
+::: {.column width="55%"}
+### Quando diciamo “leggiamo il cervello”
+
+In realtà non leggiamo mai direttamente il cervello.
+
+Leggiamo **tracce indirette**:
+
+- attività elettrica
+- variazioni emodinamiche
+- comportamento oculare
+- diametro pupillare
+- tempi di risposta
+
+Poi trasformiamo queste tracce in **dati**, e i dati in **interpretazioni**.
+:::
+
+::: {.column width="45%"}
+### Messaggio chiave
+
+> Il dato non è semplicemente trovato.  
+> Il dato viene **costruito**.
+
+::: {.fragment}
+Questo vale ancora di più nelle neuroscienze e nella psicofisiologia, dove il segnale è spesso rumoroso, indiretto e dipendente dal contesto.
+:::
+:::
+:::
+
+## Un cervello di punti
+
+```{r}
+#| fig-width: 15
+#| fig-height: 7
+
+library(tidyverse)
+library(plotly)
+
+set.seed(123)
+
+# ------------------------------------------------------------------
+# ESEMPIO DIVULGATIVO SUL MULTIVERSE ANALITICO
+#
+# Stesso esperimento, stessi partecipanti, stessa area cerebrale target.
+# Tre laboratori vogliono capire se "l'area si accende".
+#
+# Ogni punto = una misura voxel/soggetto/contrasto che entra nell'analisi
+#
+# x = forza dell'effetto stimato
+#     sinistra  -> effetto debole o nullo
+#     destra    -> effetto forte
+#
+# y = affidabilità / stabilità del segnale
+#     basso     -> segnale instabile
+#     alto      -> segnale stabile
+#
+# I tre laboratori trattano gli stessi dati in modo diverso:
+# - Lab 1: pipeline conservativa
+# - Lab 2: pipeline aggressiva / più sensibile
+# - Lab 3: pipeline focalizzata sulla ROI
+#
+# Punto chiave:
+# - a volte i laboratori arrivano alla STESSA conclusione con nuvole molto diverse
+# - altre volte arrivano a conclusioni DIVERSE guardando dati che si sovrappongono molto
+# ------------------------------------------------------------------
+
+# Sfondo comune: stessa base dati condivisa da tutti i laboratori
+n_shared <- 950
+base_shared <- tibble(
+  x = pmin(pmax(rnorm(n_shared, 5.2, 1.45), 0), 10),
+  y = pmin(pmax(rnorm(n_shared, 5.0, 1.55), 0), 10),
+  gruppo = "Dati comuni",
+  lab = "Base condivisa",
+  conclusione = "Segnale ambiguo: dipende dalla pipeline",
+  descrizione = "Stesso dataset di partenza: nessuna conclusione è ancora inevitabile"
+)
+
+# LAB 1: CONSERVATIVO
+# Tiene solo segnali stabili; perde effetti marginali ma mostra una nube compatta
+# Conclusione: SI ACCENDE
+n_lab1 <- 260
+lab1 <- tibble(
+  x = pmin(pmax(rnorm(n_lab1, 6.6, 0.55), 0), 10),
+  y = pmin(pmax(rnorm(n_lab1, 8.0, 0.45), 0), 10),
+  gruppo = "Lab 1 • conservativo",
+  lab = "Lab 1",
+  conclusione = "Conclusione: l'area si accende",
+  descrizione = "Preprocessing prudente: pochi punti, molto stabili, cluster compatto"
+)
+
+# LAB 2: AGGRESSIVO / SENSIBILE
+# Tiene dentro più punti, guadagna sensibilità ma aumenta dispersione
+# Conclusione: SI ACCENDE
+n_lab2 <- 340
+x2 <- pmin(pmax(rnorm(n_lab2, 6.3, 1.05), 0), 10)
+lab2 <- tibble(
+  x = x2,
+  y = pmin(pmax(4.1 + 0.35 * x2 + rnorm(n_lab2, 0, 0.95), 0), 10),
+  gruppo = "Lab 2 • sensibile",
+  lab = "Lab 2",
+  conclusione = "Conclusione: l'area si accende",
+  descrizione = "Pipeline più permissiva: più punti, più rumore, stessa conclusione finale"
+)
+
+# LAB 3: ROI FOCALIZZATA
+# Restringe la selezione alla regione d'interesse; forma molto diversa
+# Conclusione: NON CONVINCENTE / NON SI ACCENDE
+n_lab3 <- 280
+lab3 <- tibble(
+  x = pmin(pmax(rnorm(n_lab3, 4.8, 0.5), 0), 10),
+  y = pmin(pmax(rnorm(n_lab3, 6.7, 0.55), 0), 10),
+  gruppo = "Lab 3 • ROI stretta",
+  lab = "Lab 3",
+  conclusione = "Conclusione: evidenza debole / non convincente",
+  descrizione = "ROI più stretta: punti ordinati e stabili, ma effetto medio più vicino alla soglia"
+)
+
+# Unione
+df_mv <- bind_rows(base_shared, lab1, lab2, lab3)
+
+# Soglie illustrative per la 'decisione'
+thr_x <- 6.0
+thr_y <- 6.2
+
+g_mv <- ggplot(
+  df_mv,
+  aes(
+    x, y,
+    color = gruppo,
+    text = paste0(
+      "<b>Pipeline:</b> ", gruppo,
+      "<br><b>Laboratorio:</b> ", lab,
+      "<br><b>Effetto stimato:</b> ", round(x, 2),
+      "<br><b>Stabilità:</b> ", round(y, 2),
+      "<br><b>Conclusione:</b> ", conclusione,
+      "<br><b>Lettura:</b> ", descrizione
+    )
+  )
+) +
+  geom_point(alpha = 0.62, size = 1.45, show.legend = TRUE) +
+
+  # Soglie illustrative
+  geom_vline(xintercept = thr_x, linetype = "dashed", alpha = 0.30,
+             color = "#34495e", linewidth = 0.7) +
+  geom_hline(yintercept = thr_y, linetype = "dashed", alpha = 0.30,
+             color = "#34495e", linewidth = 0.7) +
+
+  annotate("text", x = 0.3, y = 10.35, label = "segnale molto stabile",
+           size = 4, color = "#7f8c8d", fontface = "italic", hjust = 0) +
+  annotate("text", x = 0.3, y = -0.45, label = "segnale poco stabile",
+           size = 4, color = "#7f8c8d", fontface = "italic", hjust = 0) +
+  annotate("text", x = 0.2, y = -0.95, label = "effetto debole",
+           size = 4, color = "#7f8c8d", fontface = "italic", hjust = 0) +
+  annotate("text", x = 9.8, y = -0.95, label = "effetto forte",
+           size = 4, color = "#7f8c8d", fontface = "italic", hjust = 1) +
+
+  annotate("text", x = 8.5, y = 9.8, label = "zona che favorisce\n'un'area si accende'",
+           size = 4.1, color = "#0f2d52", fontface = "bold", hjust = 1) +
+  annotate("text", x = 4.7, y = 7.7, label = "zona borderline:\nforma ordinata,\nconclusione incerta",
+           size = 4.0, color = "#7b5ea7", fontface = "bold", hjust = 1) +
+
+  scale_color_manual(
+    values = c(
+      "Dati comuni" = "#C7CED6",
+      "Lab 1 • conservativo" = "#E74C3C",
+      "Lab 2 • sensibile" = "#F39C12",
+      "Lab 3 • ROI stretta" = "#2E86C1"
+    ),
+    labels = c(
+      "Dati comuni" = "Base condivisa • stesso dataset di partenza",
+      "Lab 1 • conservativo" = "Lab 1 • nube compatta, conclude 'si accende'",
+      "Lab 2 • sensibile" = "Lab 2 • nube dispersa, conclude 'si accende'",
+      "Lab 3 • ROI stretta" = "Lab 3 • nube ordinata, conclude 'evidenza debole'"
+    )
+  ) +
+
+  coord_equal(xlim = c(0, 10), ylim = c(0, 10.6)) +
+  labs(
+    title = "Multiverse analitico: tre laboratori, stessi dati, forme e conclusioni diverse",
+    subtitle = "Pipeline diverse possono produrre la stessa conclusione con nuvole diverse, oppure conclusioni diverse con dati molto simili",
+    x = "Forza dell'effetto stimato nell'area cerebrale",
+    y = "Stabilità / affidabilità del segnale",
+    color = "Analisi dei tre laboratori"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 11),
+    plot.title = element_text(face = "bold", size = 20, colour = "#0f2d52", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, colour = "#284b7a", hjust = 0.5, margin = margin(b = 15)),
+    axis.title.x = element_text(size = 10.5, color = "#7f8c8d", face = "italic"),
+    axis.title.y = element_text(size = 10.5, color = "#7f8c8d", face = "italic"),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplotly(g_mv, tooltip = "text") |>
+  layout(
+    showlegend = TRUE,
+    legend = list(
+      orientation = "h",
+      x = 0.5,
+      xanchor = "center",
+      y = -0.18
+    )
+  ) |>
+  config(displayModeBar = FALSE)
+
+```
+
+## Perché parlarne alla Brain Awareness Week
+
+
+- perché dai dati sul cervello dipendono narrazioni su attenzione, apprendimento, memoria, sviluppo, disturbi
+- perché un grafico convincente può sembrare una verità oggettiva
+- perché decisioni tecniche invisibili possono cambiare il risultato finale
+
+::: {.callout-important}
+La domanda giusta non è solo: **“cosa mostra il dato?”**  
+La domanda giusta è: **“come è stato costruito quel dato?”**
+:::
+
+## Cosa misuriamo davvero
+
+::: {.columns}
+::: {.column width="50%"}
+### Un esempio semplice: la pupilla
+
+La pupilla può essere usata come indice di:
+
+- attenzione
+- arousal
+- carico cognitivo
+- orientamento verso uno stimolo
+:::
+
+::: {.column width="50%"}
+### Ma la pupilla cambia anche per
+
+- luce e luminanza
+- movimenti oculari
+- battiti di ciglia
+- fatica
+- noia
+- rumore di misura
+:::
+:::
+
+::: {.fragment}
+Lo stesso segnale può quindi raccontare **storie diverse**.
+:::
+
+## Pupilla dinamica: arte e misura
+
+```{r}
+#| fig-width: 13
+#| fig-height: 6
+
+library(shiny)
+library(plotly)
+
+# Funzione per generare pupilla dinamica
+generate_pupil <- function(pupil_size = 0.9, light_level = 0.5, attention = 0.5) {
+  
+  # IRIDE (fissa)
+  n_iris <- 1200
+  theta_iris <- runif(n_iris, 0, 2*pi)
+  r_iris <- sqrt(runif(n_iris, 0.5, 1))  # anello esterno
+  iris <- tibble(
+    x = 2.2 * r_iris * cos(theta_iris),
+    y = 2.2 * r_iris * sin(theta_iris),
+    zone = "iride"
+  )
+  
+  # PUPILLA (varia in base a parametri)
+  # Dimensione base influenzata da luce e attenzione
+  base_size <- pupil_size * (1 - light_level * 0.6) * (1 + attention * 0.4)
+  
+  n_pupil <- 800
+  theta_pup <- runif(n_pupil, 0, 2*pi)
+  r_pup <- sqrt(runif(n_pupil, 0, 1))
+  pupil <- tibble(
+    x = base_size * r_pup * cos(theta_pup),
+    y = base_size * r_pup * sin(theta_pup),
+    zone = "pupilla"
+  )
+  
+  # PALPEBRA
+  eyelid <- tibble(
+    x = seq(-3.2, 3.2, length.out = 200),
+    y_top = 0.42 * sqrt(pmax(0, 10 - x^2)),
+    y_bottom = -0.42 * sqrt(pmax(0, 10 - x^2))
+  )
+  
+  list(iris = iris, pupil = pupil, eyelid = eyelid, size = base_size)
+}
+
+# Stati predefiniti
+states <- list(
+  "Luce intensa" = list(light = 0.9, attention = 0.5, pupil = 0.6),
+  "Buio" = list(light = 0.1, attention = 0.5, pupil = 1.0),
+  "Alta attenzione" = list(light = 0.5, attention = 0.9, pupil = 0.9),
+  "Rilassato" = list(light = 0.5, attention = 0.2, pupil = 0.7),
+  "Carico cognitivo" = list(light = 0.5, attention = 1.0, pupil = 1.1),
+  "Sorpresa" = list(light = 0.4, attention = 0.95, pupil = 1.15)
+)
+
+# Genera pupille per tutti gli stati
+all_pupils <- map_dfr(names(states), function(state_name) {
+  params <- states[[state_name]]
+  pup_data <- generate_pupil(params$pupil, params$light, params$attention)
+  
+  bind_rows(
+    pup_data$iris |> mutate(state = state_name),
+    pup_data$pupil |> mutate(state = state_name)
+  ) |>
+    mutate(
+      pupil_diameter = round(pup_data$size * 3, 2),
+      light_pct = round(params$light * 100),
+      attention_pct = round(params$attention * 100)
+    )
+})
+
+# Palpebra (uguale per tutti)
+eyelid_data <- tibble(
+  x = seq(-3.2, 3.2, length.out = 200),
+  y_top = 0.42 * sqrt(pmax(0, 10 - x^2)),
+  y_bottom = -0.42 * sqrt(pmax(0, 10 - x^2))
+)
+
+# Crea plot interattivo con dropdown
+initial_state <- "Luce intensa"
+initial_data <- all_pupils |> filter(state == initial_state)
+
+fig <- plot_ly() |>
+  
+  # Palpebra superiore
+  add_trace(
+    data = eyelid_data,
+    x = ~x, y = ~y_top,
+    type = "scatter", mode = "lines",
+    line = list(color = "#0f2d52", width = 3),
+    showlegend = FALSE,
+    hoverinfo = "skip"
+  ) |>
+  
+  # Palpebra inferiore
+  add_trace(
+    data = eyelid_data,
+    x = ~x, y = ~y_bottom,
+    type = "scatter", mode = "lines",
+    line = list(color = "#0f2d52", width = 3),
+    showlegend = FALSE,
+    hoverinfo = "skip"
+  )
+
+# Aggiungi trace per ogni stato
+for (state_name in names(states)) {
+  state_data <- all_pupils |> filter(state == state_name)
+  
+  # Iride
+  iris_data <- state_data |> filter(zone == "iride")
+  fig <- fig |>
+    add_trace(
+      data = iris_data,
+      x = ~x, y = ~y,
+      type = "scatter", mode = "markers",
+      marker = list(color = "#4ECDC4", size = 3, opacity = 0.4),
+      visible = ifelse(state_name == initial_state, TRUE, FALSE),
+      name = paste0(state_name, " - Iride"),
+      showlegend = FALSE,
+      hovertemplate = paste0(
+        "<b>", state_name, "</b><br>",
+        "Zona: Iride<br>",
+        "Luminosità ambientale: ", unique(iris_data$light_pct), "%<br>",
+        "Livello attenzione: ", unique(iris_data$attention_pct), "%<br>",
+        "<extra></extra>"
+      )
+    )
+  
+  # Pupilla
+  pupil_data <- state_data |> filter(zone == "pupilla")
+  fig <- fig |>
+    add_trace(
+      data = pupil_data,
+      x = ~x, y = ~y,
+      type = "scatter", mode = "markers",
+      marker = list(color = "#1a1a1a", size = 4, opacity = 0.85),
+      visible = ifelse(state_name == initial_state, TRUE, FALSE),
+      name = paste0(state_name, " - Pupilla"),
+      showlegend = FALSE,
+      hovertemplate = paste0(
+        "<b>", state_name, "</b><br>",
+        "Zona: Pupilla<br>",
+        "Diametro: ", unique(pupil_data$pupil_diameter), " mm<br>",
+        "Luminosità: ", unique(pupil_data$light_pct), "%<br>",
+        "Attenzione: ", unique(pupil_data$attention_pct), "%<br>",
+        "<extra></extra>"
+      )
+    )
+}
+
+# Crea menu dropdown
+buttons <- map(seq_along(states), function(i) {
+  state_name <- names(states)[i]
+  # Ogni stato ha 2 trace (iride + pupilla), più 2 trace fisse (palpebre)
+  visible_vector <- rep(FALSE, length(names(states)) * 2 + 2)
+  visible_vector[1:2] <- TRUE  # palpebre sempre visibili
+  visible_vector[2 + (i-1)*2 + 1:2] <- TRUE  # iride e pupilla dello stato
+  
+  list(
+    method = "update",
+    args = list(
+      list(visible = visible_vector),
+      list(
+        title = paste0(
+          "<b>Pupillometria dinamica: ", state_name, "</b><br>",
+          "<sub>Luminosità: ", states[[state_name]]$light * 100, 
+          "% • Attenzione: ", states[[state_name]]$attention * 100, "%</sub>"
+        )
+      )
+    ),
+    label = state_name
+  )
+})
+
+# Layout finale
+fig <- fig |>
+  layout(
+    title = list(
+      text = paste0(
+        "<b>Pupillometria dinamica: ", initial_state, "</b><br>",
+        "<sub>Luminosità: ", states[[initial_state]]$light * 100,
+        "% • Attenzione: ", states[[initial_state]]$attention * 100, "%</sub>"
+      ),
+      font = list(size = 20, color = "#0f2d52")
+    ),
+    xaxis = list(
+      visible = FALSE,
+      range = c(-3.5, 3.5)
+    ),
+    yaxis = list(
+      visible = FALSE,
+      scaleanchor = "x",
+      scaleratio = 1,
+      range = c(-2, 2)
+    ),
+    updatemenus = list(
+      list(
+        type = "dropdown",
+        active = 0,
+        buttons = buttons,
+        x = 0.5,
+        xanchor = "center",
+        y = 1.15,
+        yanchor = "top",
+        bgcolor = "#e8f4f8",
+        bordercolor = "#0f2d52",
+        borderwidth = 2,
+        font = list(size = 14, color = "#0f2d52")
+      )
+    ),
+    annotations = list(
+      list(
+        text = "💡 Seleziona uno stato cognitivo:",
+        x = 0.5,
+        xref = "paper",
+        y = 1.22,
+        yref = "paper",
+        xanchor = "center",
+        yanchor = "bottom",
+        showarrow = FALSE,
+        font = list(size = 13, color = "#284b7a", family = "Arial")
+      )
+    ),
+    plot_bgcolor = "#f8f9fa",
+    paper_bgcolor = "#ffffff",
+    margin = list(t = 120, b = 40, l = 40, r = 40)
+  ) |>
+  config(displayModeBar = FALSE)
+
+fig
+```
+
+::: {.fragment}
+Ogni passaggio introduce **decisioni**.  
+Ogni decisione apre più di una strada plausibile.
+:::
+
+## Primo passaggio: raccolta del segnale
+
+### Qui iniziano già i problemi
+
+- il cervello non parla in modo pulito
+- gli strumenti hanno limiti
+- i partecipanti si muovono, si stancano, si distraggono
+- il contesto sperimentale modifica ciò che osserviamo
+
+::: {.callout-note}
+Nelle misure psicofisiologiche il segnale utile e il rumore convivono fin dall’inizio.
+:::
+
+## Segnale, rumore, blink
+
+```{r}
+#| fig-width: 12
+#| fig-height: 6
+
+library(tidyverse)
+library(plotly)
+library(zoo)
+
+set.seed(42)
+
+n <- 700
+t <- seq(0, 24, length.out = n)
+
+# SEGNALE LATENTE ------------------------------------------------
+true <- 0.9 * sin(0.9 * t) + 0.35 * cos(0.22 * t + 0.4)
+
+# SEGNALE GREZZO (fortemente diverso) ----------------------------
+raw <- true * 1.5 +                          # scala più grande
+  1.2 * sin(4.5 * t) +                       # alta frequenza forte
+  rnorm(n, 0, 0.9)                           # rumore molto alto
+
+# spike enormi
+spike_idx <- sample(1:n, 35)
+raw[spike_idx] <- raw[spike_idx] + sample(c(-1, 1), 35, replace = TRUE) * runif(35, 3, 6)
+
+# blink lunghi e visibili
+blink_starts <- c(90, 200, 350, 500)
+for (b in blink_starts) {
+  raw[b:(b+30)] <- NA
+}
+
+# INTERPOLAZIONE -------------------------------------------------
+interp <- zoo::na.approx(raw, na.rm = FALSE)
+
+# SMOOTH ---------------------------------------------------------
+smooth <- stats::filter(interp, rep(1/60, 60), sides = 1)
+smooth <- as.numeric(smooth)
+
+# DATA -----------------------------------------------------------
+sig <- tibble(
+  t = t,
+  raw = raw,
+  interp = interp,
+  smooth = smooth,
+  true = true
+)
+
+# PLOT -----------------------------------------------------------
+g_signal <- ggplot() +
+  # altri segnali sotto
+  geom_line(data = sig, aes(t, true, color = "Segnale latente"), linewidth = 1) +
+  geom_line(data = sig, aes(t, interp, color = "Interpolato"), linewidth = 1) +
+  geom_line(data = sig, aes(t, smooth, color = "Smoothed"), linewidth = 1) +
+  
+  # GREZZO SOPRA, più spesso
+  geom_line(data = sig, aes(t, raw, color = "Segnale grezzo"), 
+            linewidth = 1.8,alpha = 0.06, na.rm = TRUE) +
+
+  scale_color_manual(values = c(
+    "Segnale grezzo" = "#e74c3c",   # rosso acceso
+    "Interpolato" = "#f39c12",
+    "Smoothed" = "#1f5fbf",
+    "Segnale latente" = "#0f2d52"
+  )) +
+
+  labs(
+    title = "Lo stesso segnale, quattro versioni incompatibili",
+    subtitle = "Il grezzo domina visivamente: rumore, spike e buchi cambiano completamente la percezione",
+    x = "Tempo",
+    y = "Ampiezza",
+    color = NULL
+  ) +
+
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5)
+  )
+
+ggplotly(g_signal, tooltip = c("x", "y", "colour")) |>
+  layout(
+    legend = list(
+      orientation = "h",
+      x = 0.5,
+      xanchor = "center",
+      y = -0.15
+    )
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+## Il cuore del problema
+
+Da quando lo analizziamo decidiamo di gestire il dato in molti modi, per esempio:
+
+- quali valori sono plausibili
+- quali valori filtrare
+- come trattare i dati mancanti
+- dove definire la baseline
+- quali osservazioni o partecipanti includere
+
+::: {.fragment}
+Queste non sono solo scelte tecniche. Sono scelte etiche.
+Sono scelte che possono cambiare il significato del risultato.
+:::
+
+## Valori estremi
+
+### Cosa facciamo con i valori implausibili o estremi?
+
+- li lasciamo
+- li filtriamo
+- li trattiamo come errore di misura
+
+::: {.callout-warning}
+Un filtro apparentemente innocuo può cambiare bontà del modello statistico, la varianza spiegata e interpretazione dell’effetto. E a cascata può influenzare la costruzione di teorie e di interventi applicativi.
+:::
+
+
+## I dati mancanti non sono un dettaglio
+
+- un blink può essere fisiologico
+- una perdita di segnale può essere tecnica
+- uno sguardo altrove può essere comportamento significativo
+- una mancata risposta può catturare informazioni utili
+
+Possibili scelte:
+
+- eliminare
+- stimare e modellare l’assenza
+
+::: {.callout-important}
+A volte il “dato mancante” non è solo mancanza.  
+Può essere parte del fenomeno.
+:::
+
+## Mappa dei dati mancanti
+
+```{r}
+#| fig-width: 12
+#| fig-height: 6
+
+g_missing <- ggplot(miss, aes(t, id, fill = missing)) +
+  geom_tile() +
+  scale_fill_manual(values = c("TRUE" = "#1f5fbf", "FALSE" = "#edf2f7"),
+                    labels = c("osservato", "mancante")) +
+  labs(
+    title = "I dati mancanti hanno una struttura",
+    subtitle = "Non sono sempre rumore casuale",
+    x = "Tempo", y = "Partecipanti", fill = NULL
+  )
+
+ggplotly(g_missing, tooltip = c("x", "y", "fill"))
+```
+
+## Baseline: Da dove comincia il cambiamento?
+
+Se misuro la variazione di attività per esempio rispetto a:
+
+- 16 ms
+- 100 ms
+- 200 ms
+
+dopo la comparsa dello stimolo, non sto facendo la stessa analisi.
+
+::: {.fragment}
+Anche il punto zero è una decisione teorica e statistica.
+:::
+
+## La baseline cambia la storia
+
+```{r}
+#| fig-width: 14
+#| fig-height: 8
+
+library(tidyverse)
+library(plotly)
+
+set.seed(123)
+
+baseline_dramatic <- function() {
+  t <- seq(-500, 2000, by = 4)
+
+  trend <- 0.02 * (t + 500) / 1000
+  response_onset <- ifelse(t > 0, 0.25 * exp(-(t - 150)^2 / (2 * 80^2)), 0)
+  emotional_response <- ifelse(t > 200, 0.35 * exp(-(t - 500)^2 / (2 * 200^2)), 0)
+  decay <- ifelse(t > 1200, -0.15 * (1 - exp(-(t - 1200) / 400)), 0)
+  noise <- rnorm(length(t), 0, 0.03)
+
+  raw <- 3.2 + trend + response_onset + emotional_response + decay + noise
+
+  b_pre   <- raw - median(raw[t >= -200 & t <= 0])
+  b_early <- raw - median(raw[t >= 0 & t <= 100])
+  b_mid   <- raw - median(raw[t >= 100 & t <= 200])
+  b_late  <- raw - median(raw[t >= 1500 & t <= 2000])
+
+  tibble(
+    t = t,
+    `Nessuna correzione` = raw,
+    `Baseline pre-stimolo (-200:0 ms)` = b_pre,
+    `Baseline riconoscimento (0:100 ms)` = b_early,
+    `Baseline pre-emozione (100:200 ms)` = b_mid,
+    `Baseline abituazione (1500:2000 ms)` = b_late
+  ) |>
+    pivot_longer(-t, names_to = "condizione", values_to = "pupil_size")
+}
+
+base_drama <- baseline_dramatic()
+
+g_drama <- ggplot(base_drama, aes(t, pupil_size, color = condizione, group = condizione)) +
+  annotate("rect", xmin = -200, xmax = 0, ymin = -Inf, ymax = Inf,
+           fill = "#e8f5e9", alpha = 0.3) +
+  annotate("rect", xmin = 300, xmax = 800, ymin = -Inf, ymax = Inf,
+           fill = "#fff3e0", alpha = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 1.1, color = "#2c3e50", alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dotted", linewidth = 0.9, color = "#7f8c8d", alpha = 0.5) +
+  geom_line(linewidth = 1.25, alpha = 0.9) +
+  scale_color_manual(values = c(
+    "Nessuna correzione" = "#95a5a6",
+    "Baseline pre-stimolo (-200:0 ms)" = "#e74c3c",
+    "Baseline riconoscimento (0:100 ms)" = "#3498db",
+    "Baseline pre-emozione (100:200 ms)" = "#f39c12",
+    "Baseline abituazione (1500:2000 ms)" = "#9b59b6"
+  )) +
+  labs(
+    title = "La baseline può invertire le conclusioni",
+    subtitle = "Stesso segnale, cinque risultati diversi",
+    x = "Tempo dall'apparizione del volto (ms)",
+    y = "Diametro pupillare",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 20, color = "#0f2d52", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, color = "#284b7a", hjust = 0.5, margin = margin(b = 15)),
+    legend.position = "bottom",
+    legend.text = element_text(size = 10.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#ecf0f1", linewidth = 0.5),
+    axis.title = element_text(size = 12)
+  ) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+ggplotly(g_drama, tooltip = c("x", "y", "colour")) |>
+  layout(
+    hovermode = "x unified",
+    legend = list(
+      orientation = "h",
+      x = 0.5,
+      xanchor = "center",
+      y = -0.16
+    )
+  ) |>
+  config(displayModeBar = FALSE)
+
+```
+
+## Inclusione ed esclusione dei partecipanti
+
+- quanti dati mancanti tolleriamo?
+- quanto rumore accettiamo?
+- chi viene considerato “troppo rumoroso” per l’analisi?
+
+::: {.fragment}
+Cambiare il campione può cambiare la conclusione.
+:::
+
+## Il dato non parla da solo: i modelli statistici
+
+Possiamo scegliere, per esempio:
+
+- medie aggregate o serie temporali
+- modello lineare o non lineare
+- effetti fissi soltanto o effetti misti
+- analisi del “se” o del “quando” emerge un effetto
+
+::: {.callout-note}
+Nel caso della pupillometria, modellare l’andamento nel tempo può essere molto più informativo che ridurre tutto a una media.
+:::
+
+## Il problema delle medie
+
+### Una media pulisce troppo
+
+Ridurre un segnale temporale a una barra media può nascondere:
+
+- quando compare un effetto
+- quanto dura
+- se cambia direzione nel tempo
+- la variabilità individuale
+
+::: {.fragment}
+Nelle neuroscienze *l'intera distribuzione dei dati* spesso è parte dell’effetto, non un dettaglio.
+:::
+
+## Media, distribuzione, tempo... cosa sto guardando?
+
+```{r}
+#| fig-width: 14
+#| fig-height: 8
+
+library(tidyverse)
+library(plotly)
+library(ggridges)
+library(ggdist)
+library(patchwork)
+library(gt)
+
+set.seed(123)
+
+indiv_full <- crossing(
+  id = paste0("S", sprintf("%02d", 1:18)),
+  t = seq(0, 10, length.out = 250),
+  cond = c("Visuale", "Audiovisiva")
+) |>
+  group_by(id, cond) |>
+  mutate(
+    individual_peak = rnorm(1, ifelse(first(cond) == "Visuale", 6.5, 5.5), 0.8),
+    individual_amplitude = rnorm(1, ifelse(first(cond) == "Visuale", 0.35, 0.25), 0.08),
+    phase_shift = runif(1, 0, 2 * pi),
+    y = 0.12 * sin(1.5 * t + phase_shift) +
+      individual_amplitude * exp(-(t - individual_peak)^2 / 2.5) +
+      rnorm(n(), 0, 0.04)
+  ) |>
+  ungroup()
+
+avg_summary <- indiv_full |>
+  group_by(cond, id) |>
+  summarise(mean_response = mean(y), .groups = "drop") |>
+  group_by(cond) |>
+  summarise(
+    media = mean(mean_response),
+    se = sd(mean_response) / sqrt(n()),
+    .groups = "drop"
+  )
+
+indiv_means <- indiv_full |>
+  group_by(cond, id) |>
+  summarise(mean_response = mean(y), .groups = "drop")
+
+dist_summary <- indiv_means |>
+  group_by(cond) |>
+  summarise(
+    media = mean(mean_response),
+    se = sd(mean_response) / sqrt(n()),
+    y_num = c(1.15, 2.15)[cur_group_id()],
+    .groups = "drop"
+  )
+
+g_means_only <- ggplot(avg_summary, aes(x = cond, y = media, fill = cond)) +
+  geom_col(width = 0.6, color = "black", linewidth = 1.2, alpha = 0.85) +
+  geom_errorbar(aes(ymin = media - se, ymax = media + se), width = 0.2, linewidth = 1.2) +
+  geom_text(aes(label = sprintf("%.3f", media)), vjust = -2.5, size = 6, fontface = "bold") +
+  scale_fill_manual(values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Versione 1: solo le medie",
+    subtitle = "Apparentemente chiaro: Visuale > Audiovisiva",
+    x = NULL,
+    y = "Risposta pupillare media (mm)",
+    caption = "Barre = media • Errori = SEM"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 22, color = "#0f2d52", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, color = "#e67e22", hjust = 0.5, margin = margin(b = 20)),
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(face = "bold", size = 14)
+  )
+g_means_only
+```
+
+## Media, distribuzione, tempo... cosa sto guardando?
+
+```{r}
+#| fig-width: 14
+#| fig-height: 8
+g_distributions <- ggplot(indiv_means, aes(x = mean_response, y = cond, fill = cond)) +
+  stat_halfeye(
+    adjust = 1.5,
+    width = 0.6,
+    justification = -0.2,
+    .width = 0,
+    point_colour = NA,
+    alpha = 0.7
+  ) +
+  geom_point(
+    aes(color = cond),
+    position = position_jitter(width = 0, height = 0.1, seed = 42),
+    size = 3.5,
+    alpha = 0.7,
+    shape = 21,
+    fill = "white",
+    stroke = 1.5
+  ) +
+  geom_pointrange(
+    data = dist_summary,
+    aes(
+      x = media,
+      y = y_num,
+      xmin = media - se,
+      xmax = media + se
+    ),
+    inherit.aes = FALSE,
+    color = "black",
+    linewidth = 1.2,
+    size = 1.2
+  ) +
+  scale_y_discrete(limits = c("Visuale", "Audiovisiva")) +
+  scale_fill_manual(values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db")) +
+  scale_color_manual(values = c("Visuale" = "#c0392b", "Audiovisiva" = "#2471a3")) +
+  labs(
+    title = "Versione 2: distribuzioni sovrapposte",
+    subtitle = "C'è grande overlap tra i gruppi",
+    x = "Risposta pupillare media individuale (mm)",
+    y = NULL,
+    caption = "Ogni punto = 1 partecipante • Curve = distribuzioni • Nero = media ± SE"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 22, color = "#0f2d52", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, color = "#f39c12", hjust = 0.5, margin = margin(b = 20)),
+    legend.position = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 14, face = "bold")
+  )
+
+g_distributions
+```
+
+## Media, distribuzione, tempo... cosa sto guardando?
+
+```{r}
+#| fig-width: 14
+#| fig-height: 8
+g_timecourse <- ggplot(indiv_full, aes(t, y, group = interaction(id, cond), color = cond)) +
+  geom_line(alpha = 0.12, linewidth = 0.6) +
+  stat_summary(
+    aes(group = cond, fill = cond),
+    fun.data = mean_se,
+    geom = "ribbon",
+    alpha = 0.25,
+    color = NA
+  ) +
+  stat_summary(
+    aes(group = cond),
+    fun = mean,
+    geom = "line",
+    linewidth = 3,
+    alpha = 0.95
+  ) +
+  annotate("rect", xmin = 4.5, xmax = 7, ymin = -Inf, ymax = Inf,
+           fill = "#fff3e0", alpha = 0.3) +
+  geom_vline(xintercept = 5, linetype = "dashed", linewidth = 1, alpha = 0.4, color = "#2c3e50") +
+  scale_color_manual(
+    values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db"),
+    labels = c("Visuale" = "Solo visivo", "Audiovisiva" = "Audiovisiva")
+  ) +
+  scale_fill_manual(
+    values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db")
+  ) +
+  labs(
+    title = "Versione 3: dinamica temporale",
+    subtitle = "L'audio anticipa la risposta ma decade prima",
+    x = "Tempo dall'inizio dello stimolo (secondi)",
+    y = "Diametro pupillare (mm)",
+    color = NULL,
+    fill = NULL,
+    caption = "Linee sottili = individui • Linea spessa = media • Ribbon = ±SE"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(face = "bold", size = 22, color = "#0f2d52", hjust = 0.5),
+    plot.subtitle = element_text(size = 14, color = "#27ae60", hjust = 0.5, margin = margin(b = 20)),
+    legend.position = "bottom",
+    legend.text = element_text(size = 13),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(face = "bold", size = 14)
+  ) +
+  guides(
+    color = guide_legend(override.aes = list(linewidth = 4, alpha = 1)),
+    fill = "none"
+  )
+g_timecourse
+```
+
+## Media, distribuzione, tempo... cosa sto guardando?
+
+```{r}
+#| fig-width: 14
+#| fig-height: 8
+g1_compact <- ggplot(avg_summary, aes(x = cond, y = media, fill = cond)) +
+  geom_col(width = 0.5, alpha = 0.8) +
+  geom_errorbar(aes(ymin = media - se, ymax = media + se), width = 0.15, linewidth = 1) +
+  geom_text(aes(label = sprintf("%.2f", media)), vjust = -1.5, fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, NA)) +
+  labs(title = "Solo medie", subtitle = "Ingannevole", x = NULL, y = "Pupil (mm)") +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5, color = "#c0392b"),
+    plot.subtitle = element_text(hjust = 0.5, color = "#e74c3c")
+  )
+
+
+g2_compact <- ggplot(indiv_means, aes(x = mean_response, y = cond, fill = cond)) +
+  stat_halfeye(adjust = 1.5, alpha = 0.6) +
+  geom_point(
+    aes(color = cond),
+    position = position_jitter(height = 0.08, seed = 42),
+    size = 2.5,
+    alpha = 0.6,
+    shape = 21,
+    fill = "white"
+  ) +
+  scale_fill_manual(values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db")) +
+  scale_color_manual(values = c("Visuale" = "#c0392b", "Audiovisiva" = "#2471a3")) +
+  labs(title = "Distribuzioni", subtitle = "Overlap evidente", x = "Pupil (mm)", y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5, color = "#f39c12"),
+    plot.subtitle = element_text(hjust = 0.5, color = "#e67e22")
+  )
+
+g3_compact <- ggplot(indiv_full, aes(t, y, group = interaction(id, cond), color = cond)) +
+  geom_line(alpha = 0.1, linewidth = 0.4) +
+  stat_summary(aes(group = cond), fun = mean, geom = "line", linewidth = 2.5) +
+  scale_color_manual(values = c("Visuale" = "#e74c3c", "Audiovisiva" = "#3498db")) +
+  labs(title = "Time course", subtitle = "Storia completa", x = "Tempo (s)", y = "Pupil (mm)") +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5, color = "#27ae60"),
+    plot.subtitle = element_text(hjust = 0.5, color = "#229954")
+  )
+
+combined <- (g1_compact | g2_compact | g3_compact) +
+  plot_annotation(
+    title = "Stesso dato, tre livelli di comprensione",
+    subtitle = "Da sinistra a destra: perdiamo l'illusione e guadagniamo la dinamica",
+    theme = theme(
+      plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "#0f2d52"),
+      plot.subtitle = element_text(size = 14, hjust = 0.5, color = "#284b7a")
+    )
+  )
+combined
+```
+
+## Qui entra il multiverse
+
+### Un dataset, molte analisi possibili
+
+```{mermaid}
+%%{init: {'theme':'dark', 'themeVariables': { 'primaryColor':'#ff6b6b','primaryTextColor':'#fff','primaryBorderColor':'#4ecdc4','lineColor':'#ffe66d','secondaryColor':'#4ecdc4','tertiaryColor':'#95e1d3','fontSize':'18px'}}}%%
+graph LR
+    A["🔬 UN DATASET<br/>18 partecipanti<br/>5000 osservazioni"]
+    
+    A ==>|"decisione 1"| B1["🔧 Filtro<br/>CONSERVATIVO<br/>±2 SD"]
+    A ==>|"decisione 1"| B2["🔧 Filtro<br/>PERMISSIVO<br/>±3 SD"]
+    
+    B1 ==>|"decisione 2"| C1["⏱️ Baseline<br/>BREVE<br/>-50:0 ms"]
+    B1 ==>|"decisione 2"| C2["⏱️ Baseline<br/>LUNGA<br/>-200:0 ms"]
+    B2 ==>|"decisione 2"| C3["⏱️ Baseline<br/>BREVE<br/>-50:0 ms"]
+    B2 ==>|"decisione 2"| C4["⏱️ Baseline<br/>LUNGA<br/>-200:0 ms"]
+    
+    C1 ==>|"decisione 3"| D1["📊 LM<br/>semplice"]
+    C1 ==>|"decisione 3"| D2["📊 LMM<br/>mixed"]
+    C2 ==>|"decisione 3"| D3["📊 LM<br/>semplice"]
+    C2 ==>|"decisione 3"| D4["📊 LMM<br/>mixed"]
+    C3 ==>|"decisione 3"| D5["📊 LM<br/>semplice"]
+    C3 ==>|"decisione 3"| D6["📊 LMM<br/>mixed"]
+    C4 ==>|"decisione 3"| D7["📊 LM<br/>semplice"]
+    C4 ==>|"decisione 3"| D8["📊 LMM<br/>mixed"]
+    
+    D1 -.-> E["🎯 8 RISULTATI<br/>POSSIBILI"]
+    D2 -.-> E
+    D3 -.-> E
+    D4 -.-> E
+    D5 -.-> E
+    D6 -.-> E
+    D7 -.-> E
+    D8 -.-> E
+    
+    style A fill:#ff6b6b,stroke:#fff,stroke-width:4px,color:#fff
+    style E fill:#4ecdc4,stroke:#fff,stroke-width:4px,color:#000
+    
+    style B1 fill:#1a535c,stroke:#4ecdc4,stroke-width:3px,color:#fff
+    style B2 fill:#1a535c,stroke:#4ecdc4,stroke-width:3px,color:#fff
+    
+    style C1 fill:#2d4059,stroke:#ffe66d,stroke-width:3px,color:#fff
+    style C2 fill:#2d4059,stroke:#ffe66d,stroke-width:3px,color:#fff
+    style C3 fill:#2d4059,stroke:#ffe66d,stroke-width:3px,color:#fff
+    style C4 fill:#2d4059,stroke:#ffe66d,stroke-width:3px,color:#fff
+    
+    style D1 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D2 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D3 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D4 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D5 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D6 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D7 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+    style D8 fill:#363062,stroke:#95e1d3,stroke-width:2px,color:#fff
+
+```
+
+::: {.fragment}
+Questo è il **multiverse**: mostrare come cambiano i risultati al variare di scelte plausibili.
+:::
+
+## Specification curve
+
+```{r}
+#| fig-width: 14
+#| fig-height: 7
+
+multi <- multi |>
+  arrange(estimate) |>
+  mutate(model = row_number())
+
+g_multi <- ggplot(multi, aes(model, estimate, color = robust)) +
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.8) +
+  geom_linerange(aes(ymin = low, ymax = high), linewidth = 1) +
+  geom_point(size = 2.7) +
+  scale_color_manual(values = c("TRUE" = "#1f5fbf", "FALSE" = "#95a5a6"),
+                     labels = c("non robusto", "robusto")) +
+  labs(
+    title = "Multiverse / specification curve",
+    subtitle = "Ogni punto è una scelta analitica plausibile; non tutte raccontano la stessa storia",
+    x = "Specificazione analitica", y = "Stima dell'effetto", color = NULL
+  )
+
+ggplotly(g_multi, tooltip = c("x", "y", "colour"))
+```
+
+## La domanda giusta
+
+### Non basta chiedere “è significativo?”
+
+Dobbiamo chiedere:
+
+- l’effetto è robusto?
+- compare in molte analisi plausibili?
+- dipende da una sola scelta nascosta?
+- resta in piedi se apro il “giardino dei sentieri che si biforcano”?
+
+## Perché è facile sbagliare strada
+
+### Perché le scelte sembrano innocue
+
+- una soglia qui
+- un filtro lì
+- un’esclusione “ragionevole”
+- una visualizzazione più pulita
+
+::: {.fragment}
+Sommandosi, queste scelte possono trasformare un risultato fragile in una storia molto convincente.
+:::
+
+## Dal segnale all'illusione
+
+```{r}
+#| fig-width: 12
+#| fig-height: 6
+
+illusione <- tibble(
+  step = factor(
+    c("Segnale grezzo", "Filtro", "AOI", "Baseline", "Modello", "Storytelling"),
+    levels = c("Segnale grezzo", "Filtro", "AOI", "Baseline", "Modello", "Storytelling")
+  ),
+  trasparenza = c(0.95, 0.78, 0.62, 0.47, 0.31, 0.18),
+  certezza_apparente = c(0.20, 0.33, 0.46, 0.62, 0.78, 0.92)
+) |>
+  pivot_longer(-step, names_to = "metrica", values_to = "value")
+
+g_illusione <- ggplot(illusione, aes(step, value, group = metrica, color = metrica)) +
+  geom_line(linewidth = 2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("trasparenza" = "#7f8c8d", "certezza_apparente" = "#c0392b"),
+                     labels = c("Trasparenza del processo", "Certezza apparente")) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Più la pipeline si chiude, più la certezza può sembrare alta",
+    subtitle = "Ma l'apparenza di precisione non coincide con la robustezza",
+    x = NULL, y = NULL, color = NULL
+  )
+
+ggplotly(g_illusione, tooltip = c("x", "y", "colour"))
+```
+
+## Il rischio per le neuroscienze
+
+### Un errore tecnico può diventare un errore teorico
+
+Da un segnale ambiguo possiamo concludere troppo in fretta:
+
+- che un gruppo “presta più attenzione”
+- che un bambino “apprende meglio”
+- che un trattamento “funziona”
+- che una differenza neurale sia stabile e reale
+
+::: {.callout-warning}
+Quando la pipeline è opaca, il salto da misura a significato è troppo rapido.
+:::
+
+## Dal laboratorio al cittadino
+
+### Perché questo riguarda tutti
+
+Le letture del cervello influenzano:
+
+- comunicazione scientifica
+- educazione
+- salute mentale e neuropsicologia
+- tecnologie digitali e neurotech
+- fiducia pubblica nella scienza
+
+::: {.fragment}
+Se il risultato è fragile, anche le sue ricadute sociali lo sono.
+:::
+
+## La crisi della riproducibilità
+
+### Non è un problema solo delle neuroscienze, ma qui si vede bene
+
+- studi difficili da replicare
+- misure fragili
+- troppa fiducia in risultati singoli
+- poca trasparenza sui passaggi analitici
+
+::: {.callout-important}
+Riproducibilità e qualità della misura sono due facce dello stesso problema.
+:::
+
+## La measurement crisis
+
+### Prima ancora di replicare, bisogna capire cosa stiamo misurando
+
+- il costrutto è ben definito?
+- l’operazionalizzazione è valida?
+- la misura è stabile?
+- il segnale riflette davvero il processo cognitivo che dichiariamo?
+
+::: {.fragment}
+Senza teoria della misura, la precisione può essere solo un’illusione.
+:::
+
+## La risposta: open science
+
+### Aprire la scatola nera
+
+Servono pratiche di trasparenza:
+
+- dati aperti
+- materiali aperti
+- codice aperto
+- preregistrazione quando possibile
+- Registered Reports
+- multiverse analysis quando ci sono molte scelte plausibili
+
+## Open science non significa solo “pubblicare file”
+
+### Significa rendere visibili le decisioni
+
+- cosa abbiamo escluso
+- perché lo abbiamo escluso
+- quali alternative erano possibili
+- quanto il risultato dipende da quelle alternative
+
+::: {.callout-note}
+La trasparenza non elimina l’incertezza.  
+La rende discutibile, controllabile, scientificamente utile.
+:::
+
+## Un messaggio importante per il cervello
+
+### Il cervello non è meno interessante se il dato è incerto
+
+È il contrario.
+
+Accettare l’incertezza:
+
+- migliora la qualità dell’inferenza
+- evita semplificazioni fuorvianti
+- protegge da interpretazioni eccessive
+- rende la scienza più affidabile
+
+## Il cervello come costellazione di scelte
+
+```{r}
+#| fig-width: 14
+#| fig-height: 7
+
+set.seed(7)
+paths <- tibble(
+  x = rep(seq(-2.3, 2.3, length.out = 120), 8),
+  curve = rep(1:8, each = 120)
+) |>
+  mutate(
+    y = 0.55 * sin(x * runif(n(), 1.4, 2.5) + curve/3) +
+        0.18 * cos(x * runif(n(), 1.4, 3.0)) +
+        rnorm(n(), 0, 0.02)
+  )
+
+g_art <- ggplot() +
+  geom_path(data = paths, aes(x, y, group = curve, color = factor(curve)), linewidth = 1.2, alpha = 0.7, show.legend = FALSE) +
+  geom_point(data = brain_df |> sample_n(1800), aes(x*1.1, y*0.95), alpha = 0.12, size = 1.1, colour = "#0f2d52") +
+  coord_equal() +
+  theme_void() +
+  labs(
+    title = "Il cervello come costellazione di scelte",
+    subtitle = "La scienza migliore non nasconde i percorsi: li mostra"
+  )
+
+ggplotly(g_art, tooltip = "none") |>
+  config(displayModeBar = FALSE)
+```
+
+
+## Come leggiamo i dati sul cervello?
+
+Li leggiamo attraverso una **pipeline di decisioni**.
+
+### Perché è facile sbagliare strada?
+
+Perché ogni decisione sembra piccola, ma molte decisioni insieme possono cambiare il risultato.
+
+### Cosa fare allora?
+
+- mostrare l'incertezza e le scelte nel trattamento del dato (pipeline)
+- testare la robustezza
+- praticare open science "as open as possible, as closed as necessary"
+- sostituire l’illusione di certezza con la trasparenza
+
+## Take-home messages
+
+1. I dati sul cervello non sono fotografie dirette della mente.
+2. Il preprocessing non è un dettaglio: è parte del risultato.
+3. Un singolo esito “significativo” non basta.
+4. La robustezza conta più dell’effetto più comodo.
+5. Open science e multiverse aiutano a non confondere una strada plausibile con l’unica strada.
+
+## Riferimenti essenziali
+
+- Calignano, G., Girardi, P., & Altoè, G. (2024). *First steps into the pupillometry multiverse of developmental science*. *Behavior Research Methods*.
+- Calignano, G. (2024). *How to deal with uncertainty in psychophysiological data pre-processing: A hands-on multiverse approach*.
+- Steegen, S., Tuerlinckx, F., Gelman, A., & Vanpaemel, W. (2016). *Increasing transparency through a multiverse analysis*. *Perspectives on Psychological Science*.
+- Dragicevic, P., Jansen, Y., Sarma, A., Kay, M., & Chevalier, F. (2019). *Explorable multiverse analyses*. *Proceedings of the 2019 CHI Conference on Human Factors in Computing Systems*.
+- Legrenzi, P., & Umiltà, C. (2009). *Neuro-mania*. *Giornale italiano di psicologia*, 36(2), 261–272.
+- Simonsohn, U., Simmons, J. P., & Nelson, L. D. (2020). *Specification curve analysis*. *Nature Human Behaviour*, 4(11), 1208–1214.
+
+## Riferimenti essenziali
+
+- Girardi, P., Vesely, A., Lakens, D., Altoè, G., Pastore, M., Calcagnì, A., & Finos, L. (2024). *Post-selection inference in multiverse analysis (PIMA): An inferential framework based on the sign flipping score test*. *Psychometrika*, 89(2), 542–568.
+- Munafò, M. R., Nosek, B. A., Bishop, D. V., Button, K. S., Chambers, C. D., Percie du Sert, N., et al. (2017). *A manifesto for reproducible science*. *Nature Human Behaviour*, 1(1), 0021.
+- Sirois, S., Brisson, J., Blaser, E., Calignano, G., Donenfeld, J., Hepach, R., et al. (2023). *The pupil collaboration: A multi-lab, multi-method analysis of goal attribution in infants*. *Infant Behavior and Development*, 73, 101890.
+
+## Grazie per l’attenzione!
+
+::: {.columns}
+::: {.column width="65%"}
+
+### Una buona scienza del cervello (e della cognizione)  
+### non elimina l’incertezza.
+
+<br>
+
+### La rende visibile.
+
+<br><br>
+
+**Trasparenza • Robustezza • Multiverse**
+
+:::
+
+::: {.column width="35%"}
+giulia.calignano@unipd.it
+Visit Psicostat website!
+<br><br><br>
+
+<img src="baw_logo.png" style="width:360px; display:block; margin-left:auto;"/>
+
+:::
+:::
