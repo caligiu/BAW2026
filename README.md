@@ -32,13 +32,16 @@ L’obiettivo è mostrare, in modo accessibile ma rigoroso, come:
 - errori di interpretazione, semplificazioni eccessive e bias siano sempre dietro l’angolo;
 - serva cautela quando si passa dai dati alle conclusioni sul funzionamento della mente e del cervello.
 
-## Struttura del repository
+```md
+# BAW2026
 
-```text
-.
-├── slide/
-│   └── index.html
-├── assets/
-│   └── img/
-│       └── logo.png
-└── README.md
+<p align="center">
+  <img src="assets/img/logo.png" alt="Logo BAW2026" width="180">
+</p>
+
+<p align="center">
+  <strong>Slide del talk divulgativo</strong><br>
+  <em>Come leggiamo i dati sul cervello e perché è facile sbagliare strada</em>
+</p>
+
+---
